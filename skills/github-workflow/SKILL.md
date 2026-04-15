@@ -59,17 +59,21 @@ Before running any `gh` commands in a session, run these checks **once** and cac
 
 ### Required fields
 
-| Field | When | Notes |
-|-------|------|-------|
-| Title | On creation | Clear, action-oriented |
-| Description | On creation | What needs to happen and why |
-| Assignee | On creation | `--assignee "@me"` |
-| Priority | On creation | P0 = urgent, P1 = important, P2 = default |
-| Size | On creation | XS / S / M / L / XL |
-| Type | On creation | **Only if the field exists on the board.** Epic, Feature, Bug, or Task |
-| Hours | **On close** | Actual hours spent — ask the developer |
+| Field | When | Source | Notes |
+|-------|------|--------|-------|
+| Title | On creation | CLI | Clear, action-oriented |
+| Description | On creation | CLI | What needs to happen and why |
+| Assignee | On creation | CLI | `--assignee "@me"` |
+| Issue Type | On creation | GraphQL (system) | Epic, Feature, Bug, or Task — **always required** |
+| Priority | On creation | GraphQL (board) | P0 = urgent, P1 = important, P2 = default |
+| Size | On creation | GraphQL (board) | XS / S / M / L / XL |
+| Hours | **On close** | GraphQL (board) | Actual hours spent — ask the developer |
 
-### Creating an issue (two-step process)
+**Issue Type** is a GitHub system-level field (not a project board field). Set it via the `updateIssueIssueType` GraphQL mutation — see "Setting Issue Type" below.
+
+**Priority, Size, Status, Hours** are project board fields. Set them via the `updateProjectV2ItemFieldValue` GraphQL mutation — see "Updating Project Fields" below.
+
+### Creating an issue (three-step process)
 
 **Step 1: Create the issue** (without `--project` — it's fragile and fails if scopes are wrong):
 
@@ -81,7 +85,40 @@ gh issue create \
   --assignee "@me"
 ```
 
-**Step 2: Add to the board and set fields:**
+**Step 2: Set the issue type** (system-level — must always be set):
+
+Query available issue types from the org (cache for session):
+
+```bash
+gh api graphql -f query='
+  query {
+    organization(login: "Nova-Digital-Solutions") {
+      issueTypes(first: 20) {
+        nodes { id name }
+      }
+    }
+  }'
+```
+
+Get the issue's node ID and set its type:
+
+```bash
+gh api graphql -f query='
+  query {
+    repository(owner: "OWNER", name: "REPO") {
+      issue(number: NUMBER) { id }
+    }
+  }'
+
+gh api graphql -f query='
+  mutation($issue: ID!, $type: ID!) {
+    updateIssueIssueType(input: {
+      issueId: $issue, issueTypeId: $type
+    }) { issue { id issueType { name } } }
+  }' -f issue="ISSUE_NODE_ID" -f type="TYPE_ID"
+```
+
+**Step 3: Add to the board and set board fields:**
 
 ```bash
 gh project item-add 1 \
@@ -89,15 +126,15 @@ gh project item-add 1 \
   --url https://github.com/OWNER/REPO/issues/NUMBER
 ```
 
-Then update project fields (Priority, Size, Status, and Type if it exists) via GraphQL. See "Updating Project Fields" below.
+Then update board fields (Priority, Size, Status) via GraphQL. See "Updating Project Fields" below.
 
 ### Discovering board fields
 
-Do not hardcode field IDs or option IDs. Query them from the board and cache for the session. The board may have different fields than expected — adapt accordingly. If a field (like Type) doesn't exist, skip it.
+Do not hardcode field IDs or option IDs. Query them from the board and cache for the session. The board may have different fields than expected — adapt accordingly.
 
 ### Inferring values from context
 
-**Type:** Epic (large, multi-issue), Feature (new functionality), Bug (broken), Task (everything else).
+**Issue Type:** Epic (large, multi-issue parent), Feature (new functionality), Bug (broken), Task (everything else).
 
 **Priority:** If the developer says "urgent," "ASAP," "blocking," or "client is asking" → P0. Otherwise default to P2.
 
@@ -141,7 +178,7 @@ If the developer hits a blocker:
 
 If new sub-tasks emerge:
 - Create new issues rather than expanding the current one
-- Link them in comments
+- Add them as sub-issues of the parent (see "Epic & Sub-Issue Management" below)
 
 ---
 
@@ -200,16 +237,94 @@ When the developer says they're done, their code is ready, or they want to "ship
 
 ## Closing an Issue
 
-Whenever an issue is being closed — whether by PR merge (auto-close via `Closes #XX`) or manually — you MUST:
+Whenever an issue is being closed — whether by PR merge (auto-close via `Closes #XX`) or manually — you MUST follow ALL steps:
 
-1. **Ask the developer how many hours they spent.** Say something like:
-   > "Issue #42 is closing. How many hours did you spend on this? I need to update the Hours field for billing."
+### 1. Choose the correct close reason
 
-2. **Update the Hours field** using the `--input` JSON pattern for number fields (see "Updating Project Fields" below).
+- **Completed** (default): Work was done and the issue is resolved.
+- **Not planned**: Issue was closed without being completed — cancelled, superseded, premature, duplicate, or won't-fix.
 
-3. **Move the issue to Done** by updating the Status field.
+```bash
+# Completed (default)
+gh issue close NUMBER --repo OWNER/REPO
 
-Do not skip this. Hours are how Nova bills clients. No hours = unbilled work.
+# Not planned
+gh issue close NUMBER --reason "not planned" --repo OWNER/REPO
+```
+
+**When to use "not planned":**
+- Issue was created prematurely (e.g., implementation issues before a PRD exists)
+- Issue is superseded by another issue or approach
+- Issue is a duplicate
+- Issue is no longer relevant
+
+### 2. Ask the developer how many hours they spent
+
+Say something like:
+> "Issue #42 is closing. How many hours did you spend on this? I need to update the Hours field for billing."
+
+For issues closed as "not planned" with no work done, confirm with the developer and set Hours to 0.
+
+### 3. Update the Hours field
+
+Use the `--input` JSON pattern for number fields (see "Updating Project Fields" below).
+
+### 4. Move the issue to Done on the board
+
+Update the Status field to "Done" via GraphQL.
+
+### 5. Check epic status
+
+If the issue is a sub-issue of an epic, check whether the epic should also be closed (see "Epic & Sub-Issue Management" below).
+
+**Do not skip any step.** Hours are how Nova bills clients. Board status must reflect reality. Close reasons must be accurate — "completed" on an issue that wasn't done is misleading.
+
+---
+
+## Epic & Sub-Issue Management
+
+GitHub has native sub-issues. Use them — don't rely on body text or comments to track parent-child relationships.
+
+### Creating an epic
+
+1. Create the issue with type **Epic** (see "Creating an issue" above).
+2. Create child issues as normal, then add them as sub-issues.
+
+### Adding a sub-issue to an epic
+
+Get the node IDs of both the parent epic and the child issue, then link them:
+
+```bash
+gh api graphql -f query='
+  mutation($parent: ID!, $child: ID!) {
+    addSubIssue(input: {
+      issueId: $parent, subIssueId: $child
+    }) { issue { id subIssues(first: 20) { nodes { number title state } } } }
+  }' -f parent="EPIC_NODE_ID" -f child="CHILD_NODE_ID"
+```
+
+### Rules
+
+- **Every non-epic issue that belongs to a larger effort must be a sub-issue of its epic.** Don't just reference the epic in the body — use the `addSubIssue` mutation.
+- **When closing sub-issues**, check if the epic is now complete. If all sub-issues are closed (completed or not planned) and no more work remains, close the epic too.
+- **When creating new issues related to an open epic**, always add them as sub-issues — don't let them float as unlinked issues.
+- **Don't close an epic while it has open sub-issues** unless the remaining sub-issues are being closed as "not planned."
+
+### Checking epic status
+
+```bash
+gh api graphql -f query='
+  query {
+    repository(owner: "OWNER", name: "REPO") {
+      issue(number: EPIC_NUMBER) {
+        title state
+        subIssues(first: 50) {
+          nodes { number title state }
+        }
+      }
+    }
+  }'
+```
 
 ---
 
