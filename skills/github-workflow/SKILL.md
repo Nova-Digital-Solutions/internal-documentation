@@ -7,23 +7,46 @@ description: "Nova Digital Solutions GitHub workflow automation. Use this skill 
 
 You are managing the GitHub workflow for Nova Digital Solutions, a software development agency. Your job is to handle all the GitHub overhead — issues, branches, PRs, project board — so the developer can focus on writing code.
 
+For technical details (GraphQL mutations, repo setup scripts, conflict resolution), see `github-workflow-guide.md`.
+
 ## Context
 
-Nova uses GitHub for everything. The org is `nova-digital-solutions`. There is one shared GitHub Projects board called **Nova Work Board** with columns: Backlog → Ready → In Progress → In Review → Done.
+Nova uses GitHub for everything. The org is `nova-digital-solutions`. There is one shared GitHub Projects board called **Nova Work Board**.
 
-Every piece of billable work must be traceable to a GitHub issue. When issues are closed, the **Hours** field on the project board must be filled in with actual hours spent. This is how Nova bills clients — there is no separate spreadsheet, the board is the source of truth.
+Every piece of billable work must be traceable to a GitHub issue. When issues are closed, the **Hours** field on the project board must be filled in with actual hours spent. This is how Nova bills clients — the board is the source of truth.
 
-## Determining the Current Repo
+## Preflight Checks
 
-Before running any `gh` commands, determine the repo from the local git config:
+Before running any `gh` commands in a session, run these checks **once** and cache the results:
 
-```bash
-git remote get-url origin
-# Returns something like: git@github.com:nova-digital-solutions/acme-web-app.git
-# Extract: nova-digital-solutions/acme-web-app
-```
+1. **Verify authentication:**
+   ```bash
+   gh auth status
+   ```
+   If not authenticated, tell the developer to run `gh auth login`.
 
-Cache this for the session so you don't re-query it on every command.
+2. **Check token scopes.** The output of `gh auth status` lists scopes. Required:
+   - `repo` — issues, PRs, repo settings
+   - `project` — reading and writing to Nova Work Board (**not** just `read:project`, which is read-only)
+   - `read:org` — org-level queries
+
+   If `project` is missing, tell the developer:
+   > Run `gh auth refresh -s project -h github.com` and complete the browser flow.
+
+3. **Determine the repo** from the local git config:
+   ```bash
+   git remote get-url origin
+   ```
+   Extract the `OWNER/REPO` slug. Cache it for the session.
+
+4. **Verify issues are enabled** on the repo:
+   ```bash
+   gh repo view OWNER/REPO --json hasIssuesEnabled
+   ```
+   If disabled, enable them:
+   ```bash
+   gh api repos/OWNER/REPO --method PATCH -f has_issues=true
+   ```
 
 ## Core Principles
 
@@ -38,143 +61,51 @@ Cache this for the session so you don't re-query it on every command.
 
 ### Required fields
 
-Every issue must have these fields populated:
+| Field | When | Notes |
+|-------|------|-------|
+| Title | On creation | Clear, action-oriented |
+| Description | On creation | What needs to happen and why |
+| Assignee | On creation | `--assignee "@me"` |
+| Priority | On creation | P0 = urgent, P1 = important, P2 = default |
+| Size | On creation | XS / S / M / L / XL |
+| Type | On creation | **Only if the field exists on the board.** Epic, Feature, Bug, or Task |
+| Hours | **On close** | Actual hours spent — ask the developer |
 
-| Field | When | How |
-|-------|------|-----|
-| Title | On creation | Set via `gh issue create --title` |
-| Description | On creation | Set via `gh issue create --body` |
-| Assignee | On creation | Set via `--assignee "@me"` |
-| Type | On creation | Set the Type field on the project: `Epic`, `Task`, `Bug`, or `Feature` |
-| Priority | On creation | Set the Priority field on the project |
-| Size | On creation | Set the Size field on the project |
-| Project | On creation | Set via `--project "Nova Work Board"` |
-| Hours | **On close** | Set the Hours field on the project (see "Closing an Issue" section) |
+### Creating an issue (two-step process)
 
-### Creating an issue
+**Step 1: Create the issue** (without `--project` — it's fragile and fails if scopes are wrong):
 
 ```bash
 gh issue create \
-  --repo REPO \
+  --repo OWNER/REPO \
   --title "CLEAR ACTION-ORIENTED TITLE" \
-  --body "DESCRIPTION: what needs to happen and why" \
-  --assignee "@me" \
-  --project "Nova Work Board"
+  --body "DESCRIPTION" \
+  --assignee "@me"
 ```
 
-After creating the issue, update the project fields (Type, Priority, Size) using the GraphQL API. See "Updating Project Fields" below.
+**Step 2: Add to the board and set fields:**
 
-Infer the Type from context:
-- **Epic** — large body of work spanning multiple tasks
-- **Feature** — new functionality
-- **Bug** — something broken
-- **Task** — maintenance, config, research, or anything that isn't a feature or bug
+```bash
+gh project item-add 1 \
+  --owner Nova-Digital-Solutions \
+  --url https://github.com/OWNER/REPO/issues/NUMBER
+```
 
-Infer Priority from the developer's language. If they say "urgent," "ASAP," "blocking," or "client is asking" → high priority. Default to medium if unclear.
+Then update project fields (Priority, Size, Status, and Type if it exists) via GraphQL. See the "GraphQL Reference" section in `github-workflow-guide.md`.
+
+### Discovering board fields
+
+Do not hardcode field IDs or option IDs. Query them from the board and cache for the session. The board may have different fields than expected — adapt accordingly. If a field (like Type) doesn't exist, skip it.
+
+### Inferring values from context
+
+**Type:** Epic (large, multi-issue), Feature (new functionality), Bug (broken), Task (everything else).
+
+**Priority:** If the developer says "urgent," "ASAP," "blocking," or "client is asking" → P0. Otherwise default to P2.
 
 ### Labels
 
-We only use one label: `blocked`. Add it when the developer says they're stuck, and leave a comment on the issue explaining why. Remove it when the blocker is resolved.
-
-```bash
-gh issue edit ISSUE_NUMBER --repo REPO --add-label "blocked"
-gh issue comment ISSUE_NUMBER --repo REPO --body "Blocked: waiting on API credentials from client"
-```
-
----
-
-## Updating Project Fields
-
-Project fields (Type, Priority, Size, Hours, Status) are managed via the GitHub GraphQL API. You need three IDs: the project ID, the item ID (issue's entry on the board), and the field ID.
-
-### Step 1: Get project ID and field IDs (cache these — they don't change)
-
-```bash
-# Get project ID
-gh api graphql -f query='
-  query {
-    organization(login: "nova-digital-solutions") {
-      projectsV2(first: 10) {
-        nodes { id title }
-      }
-    }
-  }'
-
-# Get all field IDs for the project
-gh api graphql -f query='
-  query {
-    node(id: "PROJECT_ID") {
-      ... on ProjectV2 {
-        fields(first: 30) {
-          nodes {
-            ... on ProjectV2Field { id name }
-            ... on ProjectV2SingleSelectField { id name options { id name } }
-            ... on ProjectV2IterationField { id name }
-          }
-        }
-      }
-    }
-  }'
-```
-
-This returns field IDs and, for single-select fields (Type, Priority, Status), the option IDs for each value (e.g., the ID for "Bug", the ID for "In Progress", etc.). Cache all of these.
-
-### Step 2: Get the item ID for a specific issue
-
-```bash
-# Find the item ID for an issue on the project board
-gh api graphql -f query='
-  query {
-    node(id: "PROJECT_ID") {
-      ... on ProjectV2 {
-        items(first: 100) {
-          nodes {
-            id
-            content {
-              ... on Issue { number }
-            }
-          }
-        }
-      }
-    }
-  }'
-```
-
-Match by issue number to get the item ID.
-
-### Step 3: Update a field value
-
-**For number fields (Hours, Size):**
-```bash
-gh api graphql -f query='
-  mutation {
-    updateProjectV2ItemFieldValue(
-      input: {
-        projectId: "PROJECT_ID"
-        itemId: "ITEM_ID"
-        fieldId: "FIELD_ID"
-        value: { number: VALUE }
-      }
-    ) { projectV2Item { id } }
-  }'
-```
-
-**For single-select fields (Type, Priority, Status):**
-```bash
-gh api graphql -f query='
-  mutation {
-    updateProjectV2ItemFieldValue(
-      input: {
-        projectId: "PROJECT_ID"
-        itemId: "ITEM_ID"
-        fieldId: "FIELD_ID"
-        value: { singleSelectOptionId: "OPTION_ID" }
-      }
-    ) { projectV2Item { id } }
-  }'
-```
-
-Use the option IDs from Step 1 (e.g., the ID for "Bug" in the Type field, or "In Progress" in the Status field).
+We use one label: `blocked`. Add it when the developer says they're stuck, and leave a comment explaining why. Remove it when the blocker is resolved.
 
 ---
 
@@ -182,20 +113,19 @@ Use the option IDs from Step 1 (e.g., the ID for "Bug" in the Type field, or "In
 
 1. **Check if an issue exists.** Search for a related open issue:
    ```bash
-   gh issue list --repo REPO --search "KEYWORDS" --state open
+   gh issue list --repo OWNER/REPO --search "KEYWORDS" --state open
    ```
 
-2. **If no issue exists, create one** with all required fields (see "Creating an Issue" above). Set the Type, Priority, and Size fields on the project.
+2. **If no issue exists, create one** using the two-step process above. Set Priority, Size, and Type (if available) via GraphQL.
 
 3. **Create a branch off `dev`:**
    ```bash
-   git checkout dev
-   git pull origin dev
+   git checkout dev && git pull origin dev
    git checkout -b SHORT-DESCRIPTIVE-NAME
    ```
-   Names should be short and descriptive: `password-reset`, `fix-login-timeout`, `update-clerk-sdk`. No prefixes or issue numbers needed.
+   Names: `password-reset`, `fix-login-timeout`, `update-clerk-sdk`. No prefixes or issue numbers.
 
-4. **Move the issue to In Progress** by updating the Status field on the project (see "Updating Project Fields").
+4. **Move the issue to In Progress** by updating the Status field on the board.
 
 5. **Tell the developer** what you created (issue number, branch name) and let them code.
 
@@ -237,7 +167,7 @@ When the developer says they're done, their code is ready, or they want to "ship
    ```
    Always include `Closes #ISSUE`. Remind the developer to add screenshots for UI changes.
 
-3. **Move the issue to In Review** on the board (update Status field).
+3. **Move the issue to In Review** on the board.
 
 4. **Routine work** — the developer can self-merge into `dev`:
    ```bash
@@ -246,14 +176,12 @@ When the developer says they're done, their code is ready, or they want to "ship
 
 5. **Needs review** — request it:
    ```bash
-   gh pr edit --add-reviewer TEAMMATE
+   gh pr edit PR_NUMBER --add-reviewer TEAMMATE
    ```
 
 ---
 
 ## When Merging to Production
-
-When the developer wants to push `dev` to production:
 
 1. **Create a PR from `dev` into `main`:**
    ```bash
@@ -277,11 +205,11 @@ When the developer wants to push `dev` to production:
 Whenever an issue is being closed — whether by PR merge (auto-close via `Closes #XX`) or manually — you MUST:
 
 1. **Ask the developer how many hours they spent.** Say something like:
-   > "Issue #42 is closing. How many hours did you spend on this? I need to update the Hours field on the board."
+   > "Issue #42 is closing. How many hours did you spend on this? I need to update the Hours field for billing."
 
-2. **Update the Hours field** on the project board using the GraphQL mutation for number fields (see "Updating Project Fields" Step 3).
+2. **Update the Hours field** using the `--input` JSON pattern for number fields (see `github-workflow-guide.md`, "Update a Number Field").
 
-3. **Move the issue to Done** by updating the Status field on the board.
+3. **Move the issue to Done** by updating the Status field.
 
 Do not skip this. Hours are how Nova bills clients. No hours = unbilled work.
 
@@ -289,106 +217,17 @@ Do not skip this. Hours are how Nova bills clients. No hours = unbilled work.
 
 ## Handling Conflicts
 
-If the developer's branch has conflicts with `dev`:
+If the developer's branch has conflicts with `dev`, see `github-workflow-guide.md` for rebase vs merge instructions. Key decision:
 
-1. Fetch the latest `dev`:
-   ```bash
-   git fetch origin
-   ```
-
-2. Rebase onto `dev` (preferred — cleaner history):
-   ```bash
-   git rebase origin/dev
-   # resolve conflicts
-   git rebase --continue
-   git push --force-with-lease
-   ```
-
-3. Or merge `dev` into the branch (simpler if rebase feels risky):
-   ```bash
-   git merge origin/dev
-   # resolve conflicts
-   git push
-   ```
-
-If the conflict involves code written by someone else, tell the developer to check with that teammate before resolving.
+- **Rebase** for small, clean branches (preferred — cleaner history)
+- **Merge** when rebase feels risky or the branch has many commits
+- If the conflict involves someone else's code, tell the developer to check with that teammate
 
 ---
 
 ## Setting Up a New Repo
 
-When the team needs a new repo:
-
-```bash
-# Create the repo
-gh repo create nova-digital-solutions/CLIENT-PROJECT \
-  --private \
-  --clone \
-  --gitignore Node \
-  --description "DESCRIPTION"
-
-cd CLIENT-PROJECT
-
-# Create dev branch
-git checkout -b dev
-git push -u origin dev
-
-# Share with the Nova team (everyone gets write access)
-gh api orgs/nova-digital-solutions/teams/nova/repos/nova-digital-solutions/CLIENT-PROJECT \
-  --method PUT \
-  --field permission=push
-
-# Set up labels — remove defaults, add only what we need
-for label in "bug" "documentation" "duplicate" "enhancement" "good first issue" "help wanted" "invalid" "question" "wontfix"; do
-  gh label delete "$label" --repo nova-digital-solutions/CLIENT-PROJECT --yes 2>/dev/null
-done
-gh label create "blocked" --repo nova-digital-solutions/CLIENT-PROJECT --color "F9D0C4" --description "Cannot proceed — see comments" --force
-
-# Configure repo settings
-gh api repos/nova-digital-solutions/CLIENT-PROJECT --method PATCH \
-  --field has_wiki=false \
-  --field has_issues=true \
-  --field has_projects=true \
-  --field has_discussions=false \
-  --field delete_branch_on_merge=true \
-  --field allow_squash_merge=true \
-  --field allow_merge_commit=false \
-  --field allow_rebase_merge=true \
-  --silent
-
-# Branch protection: main (requires PR + 1 review)
-gh api repos/nova-digital-solutions/CLIENT-PROJECT/branches/main/protection --method PUT --input - <<'EOF'
-{
-  "required_status_checks": { "strict": true, "contexts": [] },
-  "enforce_admins": false,
-  "required_pull_request_reviews": {
-    "required_approving_review_count": 1,
-    "dismiss_stale_reviews": true
-  },
-  "restrictions": null,
-  "required_conversation_resolution": true
-}
-EOF
-
-# Branch protection: dev (requires PR, no review needed, self-merge OK)
-gh api repos/nova-digital-solutions/CLIENT-PROJECT/branches/dev/protection --method PUT --input - <<'EOF'
-{
-  "required_status_checks": null,
-  "enforce_admins": false,
-  "required_pull_request_reviews": {
-    "required_approving_review_count": 0,
-    "dismiss_stale_reviews": false
-  },
-  "restrictions": null
-}
-EOF
-```
-
-Then remind the developer to:
-- Add the repo to the Nova Work Board (Projects → Auto-add)
-- Link to Vercel (production from `main`, staging from `dev`)
-- Enable CodeRabbit
-- Subscribe the Slack channel: `/github subscribe nova-digital-solutions/CLIENT-PROJECT`
+See the full setup script and post-setup checklist in `github-workflow-guide.md`, "New Repo Setup" section.
 
 ---
 
@@ -397,21 +236,16 @@ Then remind the developer to:
 When the developer asks what's on the board, what to work on, or project status:
 
 ```bash
-# Issues assigned to me
-gh issue list --repo REPO --assignee "@me" --state open
-
-# All open PRs
-gh pr list --repo REPO
-
-# PRs waiting for my review
-gh pr list --repo REPO --search "review-requested:@me"
+gh issue list --repo OWNER/REPO --assignee "@me" --state open
+gh pr list --repo OWNER/REPO
+gh pr list --repo OWNER/REPO --search "review-requested:@me"
 ```
 
-Present results in a clean summary. Suggest what to work on next based on priorities (high priority first, then whatever's in Ready).
+Present results in a clean summary. Suggest what to work on next based on priorities (P0 first, then P1, then whatever's in Backlog).
 
 ---
 
-## Reference
+## Quick Reference
 
 ### Branching model
 ```
@@ -426,3 +260,6 @@ Flow: branch off dev → work → PR into dev → PR dev into main (with review)
 
 ### Commit types
 `feat` · `fix` · `chore` · `docs` · `refactor` · `test`
+
+### Required scopes
+`repo` · `project` · `read:org`
