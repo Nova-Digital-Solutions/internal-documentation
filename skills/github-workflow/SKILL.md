@@ -7,8 +7,6 @@ description: "Nova Digital Solutions GitHub workflow automation. Use this skill 
 
 You are managing the GitHub workflow for Nova Digital Solutions, a software development agency. Your job is to handle all the GitHub overhead — issues, branches, PRs, project board — so the developer can focus on writing code.
 
-For technical details (GraphQL mutations, repo setup scripts, conflict resolution), see `github-workflow-guide.md`.
-
 ## Context
 
 Nova uses GitHub for everything. The org is `nova-digital-solutions`. There is one shared GitHub Projects board called **Nova Work Board**.
@@ -91,7 +89,7 @@ gh project item-add 1 \
   --url https://github.com/OWNER/REPO/issues/NUMBER
 ```
 
-Then update project fields (Priority, Size, Status, and Type if it exists) via GraphQL. See the "GraphQL Reference" section in `github-workflow-guide.md`.
+Then update project fields (Priority, Size, Status, and Type if it exists) via GraphQL. See "Updating Project Fields" below.
 
 ### Discovering board fields
 
@@ -207,7 +205,7 @@ Whenever an issue is being closed — whether by PR merge (auto-close via `Close
 1. **Ask the developer how many hours they spent.** Say something like:
    > "Issue #42 is closing. How many hours did you spend on this? I need to update the Hours field for billing."
 
-2. **Update the Hours field** using the `--input` JSON pattern for number fields (see `github-workflow-guide.md`, "Update a Number Field").
+2. **Update the Hours field** using the `--input` JSON pattern for number fields (see "Updating Project Fields" below).
 
 3. **Move the issue to Done** by updating the Status field.
 
@@ -217,17 +215,189 @@ Do not skip this. Hours are how Nova bills clients. No hours = unbilled work.
 
 ## Handling Conflicts
 
-If the developer's branch has conflicts with `dev`, see `github-workflow-guide.md` for rebase vs merge instructions. Key decision:
+If the developer's branch has conflicts with `dev`:
 
-- **Rebase** for small, clean branches (preferred — cleaner history)
-- **Merge** when rebase feels risky or the branch has many commits
-- If the conflict involves someone else's code, tell the developer to check with that teammate
+1. **Rebase** (preferred — cleaner history):
+   ```bash
+   git fetch origin
+   git rebase origin/dev
+   # resolve conflicts, then:
+   git add .
+   git rebase --continue
+   git push --force-with-lease
+   ```
+
+2. **Merge** (simpler if rebase feels risky or branch has many commits):
+   ```bash
+   git fetch origin
+   git merge origin/dev
+   # resolve conflicts, then:
+   git add .
+   git commit
+   git push
+   ```
+
+If the conflict involves someone else's code, tell the developer to check with that teammate before resolving.
 
 ---
 
 ## Setting Up a New Repo
 
-See the full setup script and post-setup checklist in `github-workflow-guide.md`, "New Repo Setup" section.
+When the team needs a new repo:
+
+```bash
+gh repo create nova-digital-solutions/CLIENT-PROJECT \
+  --private --clone --gitignore Node --description "DESCRIPTION"
+
+cd CLIENT-PROJECT
+git checkout -b dev
+git push -u origin dev
+
+# Team access
+gh api orgs/nova-digital-solutions/teams/nova/repos/nova-digital-solutions/CLIENT-PROJECT \
+  --method PUT --field permission=push
+
+# Labels — remove defaults, keep only blocked
+for label in "bug" "documentation" "duplicate" "enhancement" "good first issue" "help wanted" "invalid" "question" "wontfix"; do
+  gh label delete "$label" --repo nova-digital-solutions/CLIENT-PROJECT --yes 2>/dev/null
+done
+gh label create "blocked" --repo nova-digital-solutions/CLIENT-PROJECT \
+  --color "F9D0C4" --description "Cannot proceed — see comments" --force
+
+# Repo settings
+gh api repos/nova-digital-solutions/CLIENT-PROJECT --method PATCH \
+  --field has_wiki=false --field has_issues=true --field has_projects=true \
+  --field has_discussions=false --field delete_branch_on_merge=true \
+  --field allow_squash_merge=true --field allow_merge_commit=false \
+  --field allow_rebase_merge=true --silent
+
+# Branch protection: main (requires PR + 1 review)
+gh api repos/nova-digital-solutions/CLIENT-PROJECT/branches/main/protection \
+  --method PUT --input - <<'EOF'
+{
+  "required_status_checks": { "strict": true, "contexts": [] },
+  "enforce_admins": false,
+  "required_pull_request_reviews": {
+    "required_approving_review_count": 1,
+    "dismiss_stale_reviews": true
+  },
+  "restrictions": null,
+  "required_conversation_resolution": true
+}
+EOF
+
+# Branch protection: dev (requires PR, self-merge OK)
+gh api repos/nova-digital-solutions/CLIENT-PROJECT/branches/dev/protection \
+  --method PUT --input - <<'EOF'
+{
+  "required_status_checks": null,
+  "enforce_admins": false,
+  "required_pull_request_reviews": {
+    "required_approving_review_count": 0,
+    "dismiss_stale_reviews": false
+  },
+  "restrictions": null
+}
+EOF
+```
+
+Then remind the developer to:
+- Add the repo to **Nova Work Board** (Projects → Auto-add)
+- Link to **Vercel** (production from `main`, staging from `dev`)
+- Enable **CodeRabbit**
+- Subscribe the Slack channel: `/github subscribe nova-digital-solutions/CLIENT-PROJECT`
+
+---
+
+## Updating Project Fields
+
+Project fields (Status, Priority, Size, Hours, and optionally Type) are managed via the GitHub GraphQL API. You need three IDs: the project ID, the item ID, and the field ID. Query and cache all of these per session.
+
+### Step 1: Get project ID and field IDs (cache these)
+
+```bash
+gh api graphql -f query='
+  query {
+    organization(login: "Nova-Digital-Solutions") {
+      projectsV2(first: 10) {
+        nodes { id title }
+      }
+    }
+  }'
+
+gh api graphql -f query='
+  query {
+    node(id: "PROJECT_ID") {
+      ... on ProjectV2 {
+        fields(first: 30) {
+          nodes {
+            ... on ProjectV2Field { id name }
+            ... on ProjectV2SingleSelectField { id name options { id name } }
+            ... on ProjectV2IterationField { id name }
+          }
+        }
+      }
+    }
+  }'
+```
+
+Cache all field IDs and option IDs. If a field like Type doesn't appear in the results, skip it.
+
+### Step 2: Get the item ID for an issue
+
+```bash
+gh api graphql -f query='
+  query {
+    node(id: "PROJECT_ID") {
+      ... on ProjectV2 {
+        items(first: 100) {
+          nodes {
+            id
+            content {
+              ... on Issue { number repository { nameWithOwner } }
+            }
+          }
+        }
+      }
+    }
+  }'
+```
+
+Match by issue number and repository to get the item ID.
+
+### Step 3: Update a single-select field (Status, Priority, Size, Type)
+
+```bash
+gh api graphql -f query='
+  mutation($p: ID!, $i: ID!, $f: ID!, $o: String!) {
+    updateProjectV2ItemFieldValue(input: {
+      projectId: $p, itemId: $i, fieldId: $f,
+      value: { singleSelectOptionId: $o }
+    }) { projectV2Item { id } }
+  }' -f p="PROJECT_ID" -f i="ITEM_ID" -f f="FIELD_ID" -f o="OPTION_ID"
+```
+
+### Step 4: Update a number field (Hours)
+
+**`-f` does not work for `Float!` variables** — it passes strings. Use `--input` with a JSON file:
+
+```bash
+cat > /tmp/update-hours.json <<'ENDJSON'
+{
+  "query": "mutation($p: ID!, $i: ID!, $f: ID!, $h: Float!) { updateProjectV2ItemFieldValue(input: { projectId: $p, itemId: $i, fieldId: $f, value: { number: $h } }) { projectV2Item { id } } }",
+  "variables": {
+    "p": "PROJECT_ID",
+    "i": "ITEM_ID",
+    "f": "HOURS_FIELD_ID",
+    "h": 2.5
+  }
+}
+ENDJSON
+
+gh api graphql --input /tmp/update-hours.json
+```
+
+Replace `2.5` with the actual hours. The `h` value must be a JSON number, not a string.
 
 ---
 
