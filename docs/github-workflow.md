@@ -1,5 +1,9 @@
 ---
 title: Nova GitHub Workflow Guide
+area: engineering
+type: guide
+onboarding: true
+onboarding-order: 1
 owner: Nova Digital Solutions
 created: 2025-01-01
 last-reviewed: 2026-04-15

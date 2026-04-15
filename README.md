@@ -1,18 +1,15 @@
 # Internal Documentation
 
-Nova Digital Solutions internal knowledge base — operational processes, SOPs, guides, policies, templates, AI skills, and automation scripts.
+Nova Digital Solutions internal knowledge base — company docs, AI skills, templates, and automation scripts.
 
 ## Structure
 
 | Folder | What goes here |
 |---|---|
-| `processes/` | Operational workflows and step-by-step procedures (e.g., client onboarding, monthly close) |
-| `sops/` | Formal Standard Operating Procedures with version control and ownership |
-| `guides/` | How-to guides, reference material, and training docs |
-| `policies/` | Company policies, compliance requirements, and rules |
-| `templates/` | Reusable templates for documents, checklists, and forms |
+| `docs/` | All written knowledge: processes, guides, policies, SOPs. See [`docs/INDEX.md`](docs/INDEX.md) for the full list. |
 | `skills/` | AI agent skills — reusable SKILL.md files for Claude, Cursor, and other AI coding assistants |
-| `scripts/` | Automation scripts and tooling (e.g., Ralph autonomous agent) |
+| `scripts/` | Automation scripts and tooling (e.g., Ralph autonomous agent, build-plan-generator) |
+| `templates/` | Reusable templates for documents, checklists, and forms |
 
 ## Conventions
 
@@ -23,9 +20,12 @@ Nova Digital Solutions internal knowledge base — operational processes, SOPs, 
 
 ### Document frontmatter
 
-```markdown
+```yaml
 ---
 title: Document Title
+area: engineering | operations | company
+type: guide | process | policy
+onboarding: false
 owner: Name or Team
 created: YYYY-MM-DD
 last-reviewed: YYYY-MM-DD
